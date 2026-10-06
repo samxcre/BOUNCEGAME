@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Bounce Choir</title>
+<script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
+<style>
+  :root { --bg:#05040f; --fg:#e8f0ff; --dim:#8794b8; --acc:#5eead4; box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg); overflow:hidden; touch-action:none;
+    font-family:"Helvetica Neue",Arial,sans-serif; -webkit-user-select:none; user-select:none; }
+  #top { position:fixed; top:0; left:0; right:0; z-index:10; display:flex; justify-content:space-between; gap:12px;
+    padding:calc(14px + env(safe-area-inset-top,0px)) 18px 0; pointer-events:none; }
+  #top h1 { margin:0; font-size:13px; letter-spacing:.35em; text-transform:uppercase; }
+  #hint { margin:6px 0 0; font-size:12px; color:var(--dim); line-height:1.5; transition:opacity 1s; }
+  #cnt { font-size:12px; letter-spacing:.15em; color:var(--acc); text-align:right; white-space:nowrap; }
+  #ui { position:fixed; left:0; right:0; bottom:0; z-index:10; display:flex; justify-content:center; flex-wrap:wrap; gap:8px;
+    padding:0 12px calc(14px + env(safe-area-inset-bottom,0px)); }
+  #ui button { font:inherit; font-size:12px; letter-spacing:.08em; color:var(--fg); background:rgba(20,24,48,.7);
+    border:1px solid rgba(160,190,255,.3); border-radius:999px; padding:10px 16px; cursor:pointer; backdrop-filter:blur(6px); }
+  #ui button.on { background:var(--acc); color:#04120f; border-color:var(--acc); }
+  #ui button:active { transform:scale(.95); }
+</style>
+<script>
+AFRAME.registerComponent('toy', {
+  init: function () {
+    const T = AFRAME.THREE, self = this;
+    this.T = T;
+    const B = this.B = [5, 3.2, 5];
+    this.balls = []; this.bounces = 0; this.hue = Math.random(); this.grav = -8; this.vortex = false;
+    this.ndc = new T.Vector2(); this.sm = new T.Vector2(); this.ray = new T.Raycaster();
+    this.sphere = new T.SphereGeometry(1, 24, 16);
+    const root = this.el.object3D;
+
+    // room: glowing edges, grid and flashing walls
+    const box = new T.BoxGeometry(B[0] * 2, B[1] * 2, B[2] * 2);
+    root.add(new T.LineSegments(new T.EdgesGeometry(box), new T.LineBasicMaterial({ color: 0x6fa8ff, transparent: true, opacity: 0.7 })));
+    const grid = new T.GridHelper(10, 10, 0x4466aa, 0x4466aa);
+    grid.position.y = -B[1]; grid.material.transparent = true; grid.material.opacity = 0.25; root.add(grid);
+    this.walls = {};
+    [['x',1],['x',-1],['y',1],['y',-1],['z',-1]].forEach(([a, s]) => {
+      const dims = a === 'x' ? [B[2], B[1]] : a === 'y' ? [B[0], B[2]] : [B[0], B[1]];
+      const m = new T.Mesh(new T.PlaneGeometry(dims[0] * 2, dims[1] * 2),
+        new T.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0, side: T.DoubleSide, depthWrite: false, blending: T.AdditiveBlending }));
+      if (a === 'x') { m.rotation.y = Math.PI / 2; m.position.x = s * B[0]; }
+      if (a === 'y') { m.rotation.x = Math.PI / 2; m.position.y = s * B[1]; }
+      if (a === 'z') { m.position.z = s * B[2]; }
+      m.userData.f = 0; root.add(m); this.walls[a + s] = m;
+    });
+
+    // spark particle pool
+    const c = document.createElement('canvas'); c.width = c.height = 64;
+    const x = c.getContext('2d'), gr = x.createRadialGradient(32, 32, 0, 32, 32, 32);
+    gr.addColorStop(0, 'rgba(255,255,255,1)'); gr.addColorStop(.35, 'rgba(255,255,255,.5)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+    x.fillStyle = gr; x.fillRect(0, 0, 64, 64);
+    const N = this.N = 3000; this.pi = 0;
+    this.pp = new Float32Array(N * 3); this.pv = new Float32Array(N * 3); this.pc = new Float32Array(N * 3);
+    this.pb = new Float32Array(N * 3); this.pl = new Float32Array(N); this.pm = new Float32Array(N).fill(1);
+    const g = new T.BufferGeometry();
+    g.setAttribute('position', new T.BufferAttribute(this.pp, 3));
+    g.setAttribute('color', new T.BufferAttribute(this.pc, 3));
+    this.pts = new T.Points(g, new T.PointsMaterial({ size: 0.28, map: new T.CanvasTexture(c), vertexColors: true,
+      transparent: true, depthWrite: false, blending: T.AdditiveBlending }));
+    this.pts.frustumCulled = false; root.add(this.pts);
+
+    // audio
+    this.ctx = null; this.voices = 0; this.lastNote = 0;
+    const wake = () => {
+      if (!this.ctx) {
+        try {
+          const AC = window.AudioContext || window.webkitAudioContext; this.ctx = new AC();
+          this.master = this.ctx.createGain(); this.master.gain.value = 0.8;
+          const comp = this.ctx.createDynamicsCompressor(); this.master.connect(comp); comp.connect(this.ctx.destination);
+        } catch (e) { this.ctx = null; }
+      }
+      if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume();
+    };
+
+    // input
+    const hint = document.getElementById('hint');
+    window.addEventListener('pointermove', (e) => this.ndc.set(e.clientX / innerWidth * 2 - 1, -(e.clientY / innerHeight * 2 - 1)));
+    window.addEventListener('pointerdown', (e) => {
+      if (e.target.closest && e.target.closest('#ui')) return;
+      wake(); this.ndc.set(e.clientX / innerWidth * 2 - 1, -(e.clientY / innerHeight * 2 - 1));
+      this.fire(); hint.style.opacity = 0;
+    });
+    const bG = document.getElementById('bG'), bV = document.getElementById('bV');
+    const flip = () => { this.grav = -this.grav; bG.classList.toggle('on', this.grav > 0); wake(); };
+    const vort = () => { this.vortex = !this.vortex; bV.classList.toggle('on', this.vortex); wake(); };
+    const pulse = () => { this.pulse(); wake(); };
+    const clear = () => { this.balls.slice().forEach(b => this.kill(b)); };
+    bG.onclick = flip; bV.onclick = vort; document.getElementById('bP').onclick = pulse; document.getElementById('bC').onclick = clear;
+    window.addEventListener('keydown', (e) => {
+      const k = e.key.toLowerCase();
+      if (k === 'g') flip(); else if (k === 'v') vort(); else if (k === 'c') clear();
+      else if (e.code === 'Space') { e.preventDefault(); pulse(); }
+    });
+
+    // opening demo
+    for (let i = 0; i < 6; i++) this.spawn(new T.Vector3((Math.random() - .5) * 6, Math.random() * 3, (Math.random() - .5) * 6),
+      new T.Vector3((Math.random() - .5) * 10, Math.random() * 4, (Math.random() - .5) * 10));
+  },
+
+  color: function () { this.hue = (this.hue + 0.618) % 1; return new this.T.Color().setHSL(this.hue, 0.95, 0.6); },
+
+  spawn: function (p, v) {
+    const T = this.T, r = 0.28 + Math.random() * 0.25, col = this.color();
+    const grp = new T.Group();
+    grp.add(new T.Mesh(this.sphere, new T.MeshBasicMaterial({ color: col })));
+    const halo = new T.Mesh(this.sphere, new T.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.22, depthWrite: false, blending: T.AdditiveBlending }));
+    halo.scale.setScalar(1.8); grp.add(halo);
+    this.el.object3D.add(grp);
+    const b = { p: p.clone(), v: v.clone(), r: r, m: r * r * r, col: col, grp: grp, f: 0 };
+    this.balls.push(b);
+    if (this.balls.length > 40) this.kill(this.balls[0]);
+    return b;
+  },
+
+  kill: function (b) {
+    this.el.object3D.remove(b.grp);
+    b.grp.traverse(o => o.material && o.material.dispose());
+    const i = this.balls.indexOf(b); if (i >= 0) this.balls.splice(i, 1);
+  },
+
+  fire: function () {
+    const cam = this.el.sceneEl.camera; if (!cam) return;
+    this.ray.setFromCamera(this.ndc, cam);
+    const o = this.ray.ray.origin, d = this.ray.ray.direction, t = (this.B[2] - 0.4 - o.z) / d.z;
+    const p = o.clone().addScaledVector(d, t);
+    p.x = Math.max(-4.4, Math.min(4.4, p.x)); p.y = Math.max(-2.8, Math.min(2.8, p.y)); p.z = Math.min(p.z, 4.4);
+    const v = d.clone().multiplyScalar(14); v.x += (Math.random() - .5) * 2; v.y += (Math.random() - .5) * 2;
+    const b = this.spawn(p, v); this.burst(p, b.col, 16, 3);
+  },
+
+  pulse: function () {
+    const T = this.T;
+    this.balls.forEach(b => {
+      const dir = b.p.clone(); if (dir.length() < 0.2) dir.set(0, 1, 0);
+      b.v.addScaledVector(dir.normalize(), 12); b.v.y += 4; b.f = 1;
+    });
+    Object.values(this.walls).forEach(w => { w.material.color.setHex(0xffffff); w.userData.f = 1; });
+    for (let i = 0; i < 80; i++) {
+      const a = Math.random() * 6.283;
+      this.emit(new T.Vector3(0, 0, 0), new T.Vector3(Math.cos(a) * 9, (Math.random() - .5) * 4, Math.sin(a) * 9), new T.Color(0xffffff), 0.9);
+    }
+    this.note(660, 0.9, 'triangle'); this.note(990, 0.6, 'sine');
+  },
+
+  emit: function (p, v, col, life) {
+    const i = this.pi, k = i * 3; this.pi = (i + 1) % this.N;
+    this.pp[k] = p.x; this.pp[k + 1] = p.y; this.pp[k + 2] = p.z;
+    this.pv[k] = v.x; this.pv[k + 1] = v.y; this.pv[k + 2] = v.z;
+    this.pb[k] = col.r; this.pb[k + 1] = col.g; this.pb[k + 2] = col.b;
+    this.pl[i] = life; this.pm[i] = life;
+  },
+
+  burst: function (p, col, n, sp) {
+    const T = this.T;
+    for (let i = 0; i < n; i++) this.emit(p, new T.Vector3(Math.random() - .5, Math.random() - .5, Math.random() - .5).normalize().multiplyScalar(sp * (0.4 + Math.random())), col, 0.5 + Math.random() * 0.5);
+  },
+
+  note: function (f, vel, type) {
+    const c = this.ctx; if (!c || this.voices > 14 || c.currentTime - this.lastNote < 0.025) return;
+    this.lastNote = c.currentTime; this.voices++;
+    const t = c.currentTime, g = c.createGain(), o = c.createOscillator(), o2 = c.createOscillator();
+    o.type = type || 'sine'; o2.type = 'sine'; o.frequency.value = f; o2.frequency.value = f * 2.01;
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(Math.min(1, vel) * 0.2, t + 0.006);
+    g.gain.exponentialRampToValueAtTime(0.0008, t + 0.7);
+    o.connect(g); o2.connect(g); g.connect(this.master); o.start(t); o2.start(t); o.stop(t + 0.75); o2.stop(t + 0.75);
+    o.onended = () => { this.voices--; };
+  },
+
+  pitch: function (y) {
+    const step = Math.max(0, Math.min(14, Math.floor((y + this.B[1]) / (this.B[1] * 2) * 15)));
+    const deg = [0, 2, 4, 7, 9][step % 5], oct = Math.floor(step / 5);
+    return 196 * Math.pow(2, (oct * 12 + deg) / 12);
+  },
+
+  hit: function (b, axis, sign, impact) {
+    if (impact < 1.2) return;
+    const w = this.walls[axis + sign];
+    if (w) { w.material.color.copy(b.col); w.userData.f = 1; }
+    b.f = 1; this.bounces++; document.getElementById('cnt').textContent = 'BOUNCES ' + this.bounces;
+    this.note(this.pitch(b.p.y), impact / 14, 'sine');
+    const cp = b.p.clone(); cp[axis] += sign * b.r; this.burst(cp, b.col, 12, 2 + impact * 0.25);
+  },
+
+  tick: function (time, delta) {
+    const T = this.T, cam = this.el.sceneEl.camera; if (!cam) return;
+    const dt = Math.min(delta / 1000, 0.033), B = this.B, balls = this.balls;
+    for (let s = 0; s < 2; s++) {
+      const h = dt / 2;
+      for (const b of balls) {
+        b.v.y += this.grav * h;
+        if (this.vortex) {
+          const r = Math.max(0.5, b.p.length()), inw = b.p.clone().multiplyScalar(-16 / r);
+          b.v.addScaledVector(inw, h); b.v.x += -b.p.z / r * 14 * h; b.v.z += b.p.x / r * 14 * h;
+        }
+        if (b.v.length() > 28) b.v.setLength(28);
+        b.p.addScaledVector(b.v, h);
+        ['x', 'y', 'z'].forEach((a, i) => {
+          const lim = B[i] - b.r;
+          if (b.p[a] > lim) { b.p[a] = lim; if (b.v[a] > 0) { const im = b.v[a]; b.v[a] = -im * 0.92; this.hit(b, a, 1, im); } }
+          else if (b.p[a] < -lim) { b.p[a] = -lim; if (b.v[a] < 0) { const im = -b.v[a]; b.v[a] = im * 0.92; this.hit(b, a, -1, im); } }
+        });
+      }
+      for (let i = 0; i < balls.length; i++) for (let j = i + 1; j < balls.length; j++) {
+        const a = balls[i], b = balls[j], d = b.p.clone().sub(a.p), dist = d.length(), md = a.r + b.r;
+        if (dist < md && dist > 1e-4) {
+          const n = d.divideScalar(dist), ov = md - dist, M = a.m + b.m;
+          a.p.addScaledVector(n, -ov * b.m / M); b.p.addScaledVector(n, ov * a.m / M);
+          const rel = a.v.clone().sub(b.v).dot(n);
+          if (rel > 0) {
+            const J = (1.9 * rel) / (1 / a.m + 1 / b.m);
+            a.v.addScaledVector(n, -J / a.m); b.v.addScaledVector(n, J / b.m);
+            if (rel > 1.5) {
+              a.f = b.f = 1; this.bounces++;
+              this.note(this.pitch((a.p.y + b.p.y) / 2) * 2, rel / 12, 'triangle');
+              this.burst(a.p.clone().add(b.p).multiplyScalar(0.5), a.col.clone().lerp(b.col, 0.5), 8, 2);
+            }
+          }
+        }
+      }
+    }
+    for (const b of balls) {
+      b.f = Math.max(0, b.f - dt * 4);
+      b.grp.position.copy(b.p); b.grp.scale.setScalar(b.r * (1 + 0.4 * b.f));
+      this.emit(b.p, new T.Vector3(0, 0, 0), b.col.clone().multiplyScalar(0.7), 0.55);
+    }
+    Object.values(this.walls).forEach(w => { w.userData.f = Math.max(0, w.userData.f - dt * 2.5); w.material.opacity = w.userData.f * 0.28; });
+    for (let i = 0, N = this.N; i < N; i++) {
+      const k = i * 3;
+      if (this.pl[i] > 0) {
+        this.pl[i] -= dt; const f = Math.max(0, this.pl[i] / this.pm[i]);
+        this.pp[k] += this.pv[k] * dt; this.pp[k + 1] += this.pv[k + 1] * dt; this.pp[k + 2] += this.pv[k + 2] * dt;
+        this.pv[k] *= 0.97; this.pv[k + 1] *= 0.97; this.pv[k + 2] *= 0.97;
+        this.pc[k] = this.pb[k] * f; this.pc[k + 1] = this.pb[k + 1] * f; this.pc[k + 2] = this.pb[k + 2] * f;
+      } else { this.pc[k] = this.pc[k + 1] = this.pc[k + 2] = 0; }
+    }
+    this.pts.geometry.attributes.position.needsUpdate = true; this.pts.geometry.attributes.color.needsUpdate = true;
+    // camera parallax, framed for any aspect ratio
+    this.sm.lerp(this.ndc, 1 - Math.exp(-dt * 4));
+    const asp = innerWidth / innerHeight, z = Math.max(13, 5 + 5.8 / (0.577 * asp));
+    const ce = document.getElementById('cam').object3D;
+    ce.position.set(this.sm.x * 2.2, 1.4 + this.sm.y * 1.2, z); cam.lookAt(0, 0, 0);
+  }
+});
+</script>
+</head>
+<body>
+<div id="top">
+  <div><h1>Bounce Choir</h1>
+    <p id="hint">Click anywhere to fire a glowing ball.<br>The room is an instrument &mdash; height is pitch.</p></div>
+  <div id="cnt">BOUNCES 0</div>
+</div>
+<div id="ui">
+  <button id="bG">Flip gravity (G)</button>
+  <button id="bV">Vortex (V)</button>
+  <button id="bP">Pulse (Space)</button>
+  <button id="bC">Clear (C)</button>
+</div>
+<a-scene background="color:#05040f" vr-mode-ui="enabled:false" device-orientation-permission-ui="enabled:false"
+         renderer="antialias:true" loading-screen="dotsColor:#5eead4; backgroundColor:#05040f">
+  <a-entity toy></a-entity>
+  <a-entity id="cam" camera="fov:60" position="0 1.4 14"></a-entity>
+</a-scene>
+</body>
+</html>
